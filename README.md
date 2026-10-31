@@ -1,70 +1,44 @@
-# How open-weight LMs know where to break a line
+# Linebreak heads in open-weight LMs
 
-Language models see tokens, not characters, yet they put line breaks in the right place in fixed-width text. [Gurnee et al. (2025)](https://arxiv.org/abs/2601.04480) showed how Claude 3.5 Haiku does it. The model keeps a running **character count**, and **boundary heads** compare that count to the length of the previous line through their query–key (QK) circuit, a so-called "twist". A boundary head attends to the previous newline when the line is about to overflow.
+Language models read tokens, yet they still put newlines in the right place in fixed-width text. [Gurnee et al. (2025)](https://arxiv.org/abs/2601.04480) worked out how Claude 3.5 Haiku does it. The model keeps a running character count, and a few attention heads compare that count with the length of the previous line, attending back to the last newline when the line is nearly full. I wanted to know if open models do the same thing, so I looked at 16 of them: Gemma-2, Qwen2.5, Pythia and GPT-2, from 160M to 32B parameters.
 
-This repo tests whether **open-weight models** do the same thing, across 16 models from 4 families (Gemma-2, Qwen2.5, Pythia, GPT-2; 0.16B–32B).
+## What I found
 
-## Results
+Most of them do. In 15 of the 16 models there are heads whose query-key scores line up on a diagonal when you plot "characters so far" against "length of the line that newline ended". Following the original paper I call these twist heads. The exception is Pythia-160M, which is also the worst at linebreaking (AUC 0.90).
 
-**1. 15 of 16 models have twist heads.** For every attention head we build the matrix of query–key scores between "current character count *i*" and "a newline ending a line of length *w*". A twist head's scores are organised by the offset *w − i*, so they form a diagonal band. Every model has such heads except Pythia-160M, which is also the worst linebreaker (AUC 0.90).
+The heads work from the text itself. Models with rotary position embeddings could get away with counting tokens since the last newline, and they don't seem to: across 57 twist heads in the 15 RoPE models, the median share of the attention score coming from the RoPE term is 0.5%. GPT-2 XL has no RoPE at all and builds the same kind of head.
 
-**2. They compare characters, not token positions.** Rotary position embeddings (RoPE) give open models an easy shortcut: estimate the distance to the newline in tokens. The heads don't use it. Across the 57 effective twist heads in the 15 RoPE models, the median share of score variance coming from the RoPE term is 0.5%. GPT-2, which has no RoPE, builds the same heads.
-
-**3. Small models use one head; large models use an ensemble.**
+How the work is split depends on model size. Up to about 2.6B parameters the RoPE models have a single twist head, and mean-ablating it makes the model break lines up to 5 characters late (Qwen2.5-0.5B L4H8: 4.8, Gemma-2-2B L13H4: 3.9, Pythia-1.4B L10H3: 3.1). Bigger models have between 3 and 13 of them, tuned to different distances from the end of the line, and removing even the most important one costs only 0.2 to 1.2 characters. GPT-2 XL is the odd one out, with three heads at 1.6B that are each strongly needed. Ablating random heads moves the break point by less than 0.5 characters in every model except one (0.9).
 
 ![twist heads vs scale](figures/twist_scaling.svg)
 
-Up to ~2.6B parameters a model has **one** effective twist head, and mean-ablating it delays line breaks by up to ~5 characters (Qwen2.5-0.5B L4H8: 4.8, Gemma-2-2B L13H4: 3.9, Pythia-1.4B L10H3: 3.1). Larger models have 3–13 twist heads tuned to different offsets, the "stereoscopic" ensemble described for Claude. Each one matters much less on its own. Random heads: ≤ 0.9 characters, and ≤ 0.5 in all but one model.
-
-**4. The character count is causal.** We find a 6-dimensional "count" subspace from class means of the residual stream and clamp it to the value for "δ characters earlier". This delays line breaks in all 15 models where clamping is interpretable: −2 to −8 characters for δ = −16. Clamping a random 6-d subspace moves the break point ≤ 0.28 characters.
+The count is causal. I found a 6-dimensional subspace that tracks the character count and clamped it to read "16 characters earlier". Every model where clamping works at all then breaks 2 to 8 characters later, while clamping a random 6-d subspace moves the break point by at most 0.28. In Gemma-2-2B, editing the query of L13H4 alone gets about half of that effect (2.7 characters; a random edit of the same size gives 0.2).
 
 ![steering](figures/steering.svg)
 
-**5. Gemma-2-2B in detail.** A single head, L13H4, does the comparison. Almost all of its score comes from content: the RoPE part carries 0.3% of the variance. Editing **only L13H4's query** toward "16 fewer characters" delays breaks by 2.7 characters (random edit of the same size: +0.2). Some nearby heads track token distance through RoPE instead, but ablating them has no effect.
-
 ![Gemma-2-2B QK decomposition](figures/gemma2-2b_qk_content_vs_rope.png)
-*Top: pre-RoPE query·key scores, query = character count, key = newline ending a line of length w. L13H4 shows the diagonal "twist". Bottom: real scores split into content and RoPE parts.*
+*Gemma-2-2B. Top row: pre-RoPE query-key scores with the character count on one axis and line length on the other; L13H4 shows the diagonal. Bottom row: the real score split into its content and RoPE parts. L11H0 tracks token distance through RoPE, but ablating it does nothing.*
 
-### What did not work
+## What didn't work
 
-- **Steering is one-sided.** "Fewer characters" moves breaks reliably; "more characters" barely does. Our unverified guess: col > width never occurs in wrapped training text.
-- **Editing the width side fails.** Shifting the newline key toward a wider or a narrower line both delay breaks, so it isn't a clean "width dial".
-- **Gemma-2-2B's count is gentler than Claude's.** Its count representation is low-dimensional, but much less curved and rippled than Claude's helix.
-- **Clamping breaks GPT-2 XL.** Even a no-op clamp collapses its linebreaking, so steering couldn't be measured there.
+Steering only goes one way. Pushing the count down delays breaks, and pushing it up does very little. My guess is that a count larger than the line width never shows up in wrapped training text, but I haven't tested it. Editing the key side of L13H4, which carries the previous line's length, delays breaks whichever way you push it, so it isn't a clean width knob. Gemma's count representation is low-dimensional but much smoother than the rippled helix reported for Claude. In GPT-2 XL, clamping hurts linebreaking even when the clamp shouldn't change anything, so it's left out of the steering plot.
 
-### Caveats
+## Caveats
 
-- **One run per model, no error bars.**
-- **Twist-head criteria are heuristic.** We changed the "effective" rule after seeing that Qwen2.5-0.5B's most important head failed the original score-only rule. Head counts change only for four Qwen models.
-- **Random-head controls aren't fully clean.** They don't exclude other weaker twist heads.
-- **Qwen models were tested on fewer samples.** Qwen's tokenizer sometimes merges a newline with neighbouring characters. Those samples are skipped, which leaves Qwen with 136 of the 400 requested.
+Each model was run once, so there are no error bars. The twist-head criteria are thresholds I chose. I also loosened the definition of an "effective" head after seeing that Qwen2.5-0.5B's most important head didn't pass the first version; this changes the counts for four Qwen models. The random-head controls didn't exclude weaker twist heads. Qwen's tokenizer merges some newlines with neighbouring characters, so the Qwen models were scored on 136 samples instead of 400.
 
-## Setup in one paragraph
+## Method
 
-Prose from [Pile-10k](https://huggingface.co/datasets/NeelNanda/pile-10k) is re-wrapped greedily at a random width of 20–100 characters, so the rule is exact: break iff `col + 1 + len(next word) > width`. The **break point** is the slack at which P(newline) = 0.5. Effects are measured as shifts in characters on 150 held-out samples. A **twist head** has η²(offset) > 0.5 in its class-mean pre-RoPE score matrix, with a peak slope within ±0.3 of 1. An **effective** twist head also attends to the newline (mean ≥ 0.01), and its score (η² ≥ 0.3) or its attention (η² ≥ 0.1) tracks remaining characters. See `linebreak/mechanism.py`.
+Prose from [Pile-10k](https://huggingface.co/datasets/NeelNanda/pile-10k) is re-wrapped greedily at a random width between 20 and 100 characters, so the right answer is always known: break when `col + 1 + len(next word) > width`. The break point is the amount of space left at which P(newline) reaches 0.5, and every effect is a shift in that point, measured on 150 held-out samples. A head counts as a twist head if, in its matrix of average pre-RoPE scores, the offset between line length and character count explains at least half the variance (η² > 0.5) and the peak moves one-for-one with the count. To count as effective it also has to attend to the newline and have its score or attention track the characters remaining. Details are in `linebreak/mechanism.py`.
 
-## Repo
-
-```
-run.py                     one model -> results/raw/<model>.json
-linebreak/
-  data.py                  wrapped prose + per-token labels (col, width, ...)
-  collect.py               one forward pass: P(newline), residuals, attention to last newline
-  analyses.py              behaviour, probes, attention head scan
-  mechanism.py             twist scan, content/RoPE split, ablation, steering, one-head edits
-  experiments.py           drivers for each step
-  arch.py                  Gemma/Qwen/Llama, GPT-NeoX (Pythia), GPT-2 adapters
-scripts/summarize.py       results/raw -> results/summary.csv, results/steering.csv
-scripts/plot.py            -> figures/
-results/raw/               per-model results used in this writeup
-```
+## Running it
 
 ```bash
 uv sync
-uv run python run.py --model google/gemma-2-2b                       # ~10 min on an 8 GB GPU
-uv run python run.py --model Qwen/Qwen2.5-32B --layer-stride 4        # needs ~80 GB
+uv run python run.py --model google/gemma-2-2b                     # ~10 min on an 8 GB GPU
+uv run python run.py --model Qwen/Qwen2.5-32B --layer-stride 4      # needs ~80 GB
 uv run python run.py --model google/gemma-2-2b --steps count,qk,heads,qk_steer --qk-head 13 4
 uv run python scripts/summarize.py && uv run python scripts/plot.py
 ```
 
-Gemma-2-9B/27B were run from the ungated mirrors `unsloth/gemma-2-9b` / `unsloth/gemma-2-27b`. The JSON files in `results/raw/` were produced with an earlier version of this code that also ran extra steps (e.g. additive steering) not kept here. Rerunning reproduces every reported number except the random-control draws.
+`run.py` writes one JSON file per model to `results/raw/`; `scripts/` turns those into `results/summary.csv` and the figures. The code lives in `linebreak/`. Gemma-2-9B and 27B came from the ungated `unsloth` mirrors. The JSON files here came from an earlier version of this code that also ran some steps I've since dropped, and rerunning reproduces every reported number except the random-control draws.
